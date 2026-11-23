@@ -1,0 +1,379 @@
+
+import cv2
+import numpy as np
+import torch
+import onnxruntime as ort
+import time
+
+from pathlib import Path
+from ultralytics import YOLO
+
+
+# --------------------------------------------------
+# 1. PROJECT PATHS
+# --------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent
+
+YOLO_PATH = PROJECT_ROOT / "yolo11n.pt"
+DEPTH_PATH = BASE_DIR / "depth" / "depth_anything_v2_vits_392.onnx"
+
+INPUT_SIZE = 392
+PROCESS_EVERY_N_FRAMES = 5
+
+
+# --------------------------------------------------
+# 2. LOAD MODELS
+# --------------------------------------------------
+
+print("\n========================================")
+print(" SIXTHSENSE OBJECT-DEPTH ASSOCIATION")
+print("========================================")
+
+if not YOLO_PATH.exists():
+    raise FileNotFoundError(f"YOLO model not found: {YOLO_PATH}")
+
+if not DEPTH_PATH.exists():
+    raise FileNotFoundError(f"Depth model not found: {DEPTH_PATH}")
+
+torch.set_num_threads(2)
+
+print("\nLoading YOLO...")
+yolo_model = YOLO(str(YOLO_PATH))
+print("YOLO loaded!")
+
+print("\nLoading Depth Anything ONNX...")
+
+options = ort.SessionOptions()
+options.intra_op_num_threads = 2
+options.inter_op_num_threads = 1
+options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+depth_session = ort.InferenceSession(
+    str(DEPTH_PATH),
+    sess_options=options,
+    providers=["CPUExecutionProvider"]
+)
+
+print("Depth model loaded!")
+
+
+# --------------------------------------------------
+# 3. PREPROCESS IMAGE FOR DEPTH MODEL
+# --------------------------------------------------
+
+def preprocess_depth(frame):
+
+    height, width = frame.shape[:2]
+
+    scale = min(INPUT_SIZE / width, INPUT_SIZE / height)
+
+    new_width = int(width * scale)
+    new_height = int(height * scale)
+
+    resized = cv2.resize(
+        frame,
+        (new_width, new_height),
+        interpolation=cv2.INTER_CUBIC
+    )
+
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    image = rgb.astype(np.float32) / 255.0
+
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+    image = (image - mean) / std
+
+    pad_left = (INPUT_SIZE - new_width) // 2
+    pad_top = (INPUT_SIZE - new_height) // 2
+
+    padded = np.zeros(
+        (INPUT_SIZE, INPUT_SIZE, 3),
+        dtype=np.float32
+    )
+
+    padded[
+        pad_top:pad_top + new_height,
+        pad_left:pad_left + new_width
+    ] = image
+
+    input_array = np.transpose(padded, (2, 0, 1))
+    input_array = np.expand_dims(input_array, axis=0)
+
+    padding_info = (pad_left, pad_top, new_width, new_height)
+
+    return input_array, padding_info
+
+
+# --------------------------------------------------
+# 4. GENERATE DEPTH MAP
+# --------------------------------------------------
+
+def estimate_depth(frame):
+
+    input_array, padding_info = preprocess_depth(frame)
+
+    input_name = depth_session.get_inputs()[0].name
+    output_name = depth_session.get_outputs()[0].name
+
+    output = depth_session.run(
+        [output_name],
+        {input_name: input_array}
+    )[0]
+
+    depth = np.squeeze(output)
+
+    pad_left, pad_top, new_width, new_height = padding_info
+
+    depth = depth[
+        pad_top:pad_top + new_height,
+        pad_left:pad_left + new_width
+    ]
+
+    height, width = frame.shape[:2]
+
+    depth = cv2.resize(
+        depth,
+        (width, height),
+        interpolation=cv2.INTER_LINEAR
+    )
+
+    return depth
+
+
+# --------------------------------------------------
+# 5. DETERMINE OBJECT DIRECTION
+# --------------------------------------------------
+
+def get_direction(center_x, frame_width):
+
+    if center_x < frame_width / 3:
+        return "LEFT"
+
+    elif center_x < 2 * frame_width / 3:
+        return "CENTRE"
+
+    else:
+        return "RIGHT"
+
+
+# --------------------------------------------------
+# 6. CALCULATE DEPTH INSIDE EACH OBJECT BOX
+# --------------------------------------------------
+
+def associate_objects_with_depth(frame, depth_map, results):
+
+    height, width = frame.shape[:2]
+
+    annotated_frame = frame.copy()
+
+    # Draw boundaries between left, centre and right.
+    first_boundary = width // 3
+    second_boundary = 2 * width // 3
+
+    cv2.line(
+        annotated_frame,
+        (first_boundary, 0),
+        (first_boundary, height),
+        (255, 255, 0),
+        1
+    )
+
+    cv2.line(
+        annotated_frame,
+        (second_boundary, 0),
+        (second_boundary, height),
+        (255, 255, 0),
+        1
+    )
+
+    boxes = results[0].boxes
+
+    if boxes is None:
+        return annotated_frame
+
+    for box in boxes:
+
+        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+
+        class_id = int(box.cls[0].item())
+        confidence = float(box.conf[0].item())
+
+        object_name = yolo_model.names[class_id]
+
+        # Keep bounding box coordinates inside the image.
+        x1 = max(0, min(x1, width - 1))
+        x2 = max(0, min(x2, width))
+        y1 = max(0, min(y1, height - 1))
+        y2 = max(0, min(y2, height))
+
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        # Extract depth values inside this object's bounding box.
+        object_depth = depth_map[y1:y2, x1:x2]
+
+        valid_depth = object_depth[np.isfinite(object_depth)]
+
+        if valid_depth.size == 0:
+            continue
+
+        median_depth = float(np.median(valid_depth))
+
+        # Determine horizontal direction.
+        center_x = (x1 + x2) // 2
+
+        direction = get_direction(center_x, width)
+
+        # Draw bounding box.
+        cv2.rectangle(
+            annotated_frame,
+            (x1, y1),
+            (x2, y2),
+            (0, 255, 0),
+            2
+        )
+
+        # Display object name, direction and relative depth score.
+        label = (
+            f"{object_name} | {direction} | "
+            f"Depth: {median_depth:.2f}"
+        )
+
+        cv2.putText(
+            annotated_frame,
+            label,
+            (x1, max(y1 - 10, 20)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 0),
+            2
+        )
+
+        print(
+            f"Object: {object_name:15} "
+            f"Direction: {direction:6} "
+            f"Relative depth score: {median_depth:.3f} "
+            f"Confidence: {confidence:.2f}"
+        )
+
+    return annotated_frame
+
+
+# --------------------------------------------------
+# 7. START WEBCAM
+# --------------------------------------------------
+
+print("\nConnecting webcam...")
+
+camera = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+
+if not camera.isOpened():
+    raise RuntimeError("Could not access webcam.")
+
+print("Webcam connected!")
+print("Press Q to exit.")
+
+
+# --------------------------------------------------
+# 8. MAIN PROCESSING LOOP
+# --------------------------------------------------
+
+frame_count = 0
+combined_view = None
+
+try:
+
+    while True:
+
+        success, frame = camera.read()
+
+        if not success:
+            print("Could not capture frame.")
+            break
+
+        frame_count += 1
+
+        if (frame_count - 1) % PROCESS_EVERY_N_FRAMES == 0:
+
+            start_time = time.time()
+
+            # Run YOLO on the captured frame.
+            results = yolo_model.predict(
+                frame,
+                imgsz=416,
+                conf=0.25,
+                device="cpu",
+                verbose=False
+            )
+
+            # Generate depth map from the same frame.
+            depth_map = estimate_depth(frame)
+
+            # Associate each detected object with its depth.
+            annotated_frame = associate_objects_with_depth(
+                frame,
+                depth_map,
+                results
+            )
+
+            # Prepare depth visualization.
+            depth_normalized = cv2.normalize(
+                depth_map,
+                None,
+                0,
+                255,
+                cv2.NORM_MINMAX
+            )
+
+            depth_normalized = depth_normalized.astype(np.uint8)
+
+            depth_colored = cv2.applyColorMap(
+                depth_normalized,
+                cv2.COLORMAP_INFERNO
+            )
+
+            inference_time = time.time() - start_time
+
+            # Display both panels.
+            combined_view = np.hstack(
+                (annotated_frame, depth_colored)
+            )
+
+            cv2.putText(
+                combined_view,
+                f"Processing time: {inference_time:.2f}s",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2
+            )
+
+            print(
+                f"\nTotal processing time: {inference_time:.2f}s"
+            )
+            print("-" * 65)
+
+        if combined_view is not None:
+
+            cv2.imshow(
+                "SixthSense - Object Depth Association",
+                combined_view
+            )
+
+        else:
+
+            cv2.imshow("SixthSense - Starting...", frame)
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+finally:
+
+    camera.release()
+    cv2.destroyAllWindows()
+
+    print("\nObject-depth association test completed!")
