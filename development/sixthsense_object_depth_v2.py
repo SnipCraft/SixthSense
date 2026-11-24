@@ -22,6 +22,28 @@ DEPTH_PATH = BASE_DIR / "depth" / "depth_anything_v2_vits_392.onnx"
 INPUT_SIZE = 392
 PROCESS_EVERY_N_FRAMES = 5
 
+# Potential navigation obstacles recognised by COCO YOLO
+
+NAVIGATION_OBSTACLE_CLASSES = {
+    "person",
+    "bicycle",
+    "car",
+    "motorcycle",
+    "bus",
+    "truck",
+    "train",
+    "bench",
+    "chair",
+    "couch",
+    "potted plant",
+    "dining table",
+    "suitcase",
+    "backpack",
+    "handbag",
+    "umbrella",
+    "skateboard"
+}
+
 
 # --------------------------------------------------
 # 2. LOAD MODELS
@@ -164,10 +186,14 @@ def get_direction(center_x, frame_width):
 # --------------------------------------------------
 
 
+
 def associate_objects_with_depth(frame, depth_map, results):
 
     height, width = frame.shape[:2]
     annotated_frame = frame.copy()
+
+    # Store structured information about detected objects.
+    detected_objects = []
 
     # Draw boundaries between left, centre and right.
     first_boundary = width // 3
@@ -182,13 +208,12 @@ def associate_objects_with_depth(frame, depth_map, results):
     boxes = results[0].boxes
 
     if boxes is None:
-        return annotated_frame
+        return annotated_frame, detected_objects
 
     for box in boxes:
 
         confidence = float(box.conf[0].item())
 
-        # Ignore low-confidence detections.
         if confidence < 0.50:
             continue
 
@@ -215,7 +240,6 @@ def associate_objects_with_depth(frame, depth_map, results):
         crop_y1 = y1 + box_height // 4
         crop_y2 = y2 - box_height // 4
 
-        # Extract depth only from the central region.
         object_depth = depth_map[
             crop_y1:crop_y2,
             crop_x1:crop_x2
@@ -232,7 +256,18 @@ def associate_objects_with_depth(frame, depth_map, results):
         center_x = (x1 + x2) // 2
         direction = get_direction(center_x, width)
 
-        # Draw original object bounding box.
+        # Store structured detection information.
+        detection = {
+            "object": object_name,
+            "direction": direction,
+            "relative_depth": median_depth,
+            "confidence": confidence,
+            "bbox": (x1, y1, x2, y2)
+        }
+
+        detected_objects.append(detection)
+
+        # Draw original bounding box.
         cv2.rectangle(
             annotated_frame,
             (x1, y1),
@@ -241,7 +276,7 @@ def associate_objects_with_depth(frame, depth_map, results):
             2
         )
 
-        # Draw central sampling region in blue.
+        # Draw central sampling region.
         cv2.rectangle(
             annotated_frame,
             (crop_x1, crop_y1),
@@ -272,11 +307,119 @@ def associate_objects_with_depth(frame, depth_map, results):
             f"Confidence: {confidence:.2f}"
         )
 
-    return annotated_frame
+    return annotated_frame, detected_objects
+
 
 
 # --------------------------------------------------
-# 7. START WEBCAM
+# 7. FILTER POTENTIAL NAVIGATION OBSTACLES
+# --------------------------------------------------
+
+def filter_navigation_obstacles(detected_objects):
+
+    potential_obstacles = []
+
+    for detection in detected_objects:
+
+        object_name = detection["object"].lower()
+
+        if object_name in NAVIGATION_OBSTACLE_CLASSES:
+
+            potential_obstacles.append(detection)
+
+    return potential_obstacles
+
+
+# --------------------------------------------------
+# 8. GROUP OBSTACLES BY DIRECTION
+# --------------------------------------------------
+
+def group_obstacles_by_direction(potential_obstacles):
+
+    directional_obstacles = {
+        "LEFT": [],
+        "CENTRE": [],
+        "RIGHT": []
+    }
+
+    for obstacle in potential_obstacles:
+
+        direction = obstacle["direction"]
+
+        if direction in directional_obstacles:
+
+            directional_obstacles[direction].append(obstacle)
+
+    return directional_obstacles
+
+    # --------------------------------------------------
+
+# --------------------------------------------------
+# 9. DECIDE SUGGESTED MOVEMENT DIRECTION
+# --------------------------------------------------
+
+def decide_movement_direction(directional_obstacles):
+
+    left_blocked = bool(directional_obstacles["LEFT"])
+    centre_blocked = bool(directional_obstacles["CENTRE"])
+    right_blocked = bool(directional_obstacles["RIGHT"])
+
+    # No obstacle detected
+    if not left_blocked and not centre_blocked and not right_blocked:
+        return "NO OBSTACLE DETECTED"
+
+    # Both side directions are blocked
+    if left_blocked and right_blocked:
+        return "STOP"
+
+    # Only left side is blocked
+    if left_blocked and not centre_blocked:
+        return "MOVE RIGHT"
+
+    # Only right side is blocked
+    if right_blocked and not centre_blocked:
+        return "MOVE LEFT"
+
+    # Centre is blocked: check available sides
+    if centre_blocked:
+
+        if not right_blocked:
+            return "MOVE RIGHT"
+
+        if not left_blocked:
+            return "MOVE LEFT"
+
+        return "STOP"
+
+def stabilize_movement_decision(
+    current_decision,
+    previous_decision,
+    consecutive_count
+):
+
+    # STOP must be immediate
+    if current_decision == "STOP":
+        return "STOP", "STOP", 2
+
+            # No obstacle detected should also be immediate
+    if current_decision == "NO OBSTACLE DETECTED":
+        return "NO OBSTACLE DETECTED", "NO OBSTACLE DETECTED", 0
+
+    # Count consecutive identical decisions
+    if current_decision == previous_decision:
+        consecutive_count += 1
+    else:
+        consecutive_count = 1
+
+    # Confirm after 2 consecutive frames
+    if consecutive_count >= 2:
+        return current_decision, current_decision, consecutive_count
+
+    return "CHECKING...", current_decision, consecutive_count    
+
+
+# --------------------------------------------------
+# 10. START WEBCAM
 # --------------------------------------------------
 
 print("\nConnecting webcam...")
@@ -291,13 +434,15 @@ print("Press Q to exit.")
 
 
 # --------------------------------------------------
-# 8. MAIN PROCESSING LOOP
+# 11. MAIN PROCESSING LOOP
 # --------------------------------------------------
 
 frame_count = 0
 combined_view = None
 
 try:
+    previous_decision = None
+    consecutive_count = 0
 
     while True:
 
@@ -326,11 +471,46 @@ try:
             depth_map = estimate_depth(frame)
 
             # Associate each detected object with its depth.
-            annotated_frame = associate_objects_with_depth(
+            annotated_frame, detected_objects = associate_objects_with_depth(
                 frame,
                 depth_map,
                 results
             )
+
+            
+            potential_obstacles = filter_navigation_obstacles(
+                detected_objects
+            )
+
+            directional_obstacles = group_obstacles_by_direction(
+                potential_obstacles
+            )
+
+            print("\nAll detected objects:")
+            print(detected_objects)
+
+            print("\nPotential navigation obstacles:")
+            print(potential_obstacles)
+
+            print("\nObstacles grouped by direction:")
+
+            for direction, obstacles in directional_obstacles.items():
+                print(f"{direction}: {obstacles}")
+
+            current_decision = decide_movement_direction(
+               directional_obstacles
+            )
+
+            movement_decision, previous_decision, consecutive_count = (
+                stabilize_movement_decision(
+                    current_decision,
+                    previous_decision,
+                    consecutive_count
+                )
+            )
+
+            print("\nSuggested Movement:")
+            print(movement_decision)
 
             # Prepare depth visualization.
             depth_normalized = cv2.normalize(
